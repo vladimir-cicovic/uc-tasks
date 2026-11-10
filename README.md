@@ -1,5 +1,3 @@
-hello
-
 ## Tasks
 
 1. If we assume running some of the services causes "Too many open files"
