@@ -1,0 +1,82 @@
+---
+# Lab: second test service "fd-hog". It wants 100 open files but has
+# LimitNOFILE=64, so it logs "Too many open files" every 2 seconds.
+# Usage:
+#   ansible-playbook test/lab-fd-hog.yml
+#   ansible-playbook test/lab-fd-hog.yml -e lab_state=absent    # remove it
+- name: Lab service fd-hog
+  hosts: app_servers
+  become: true
+  vars:
+    lab_state: present
+    lab_nofile: 64
+
+  tasks:
+    - name: Install fd-hog
+      ansible.builtin.copy:
+        src: fd-hog.py
+        dest: /usr/local/lib/fd-hog/
+        owner: root
+        group: root
+        mode: "0755"
+      when: lab_state == 'present'
+
+    - name: Install the fd-hog unit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/fd-hog.service
+        content: |
+          # lab: test service with a low open files limit
+          [Unit]
+          Description=Lab service that keeps many files open
+
+          [Service]
+          ExecStart=/usr/bin/python3 /usr/local/lib/fd-hog/fd-hog.py
+          Environment=FD_HOG_FILES=100 FD_HOG_INTERVAL=2
+          LimitNOFILE={{ lab_nofile }}
+          DynamicUser=yes
+          NoNewPrivileges=yes
+          ProtectSystem=strict
+          ProtectHome=yes
+          PrivateTmp=yes
+
+          [Install]
+          WantedBy=multi-user.target
+        owner: root
+        group: root
+        mode: "0644"
+      when: lab_state == 'present'
+
+    - name: Remove the fix from an earlier run
+      ansible.builtin.file:
+        path: /etc/systemd/system/fd-hog.service.d
+        state: absent
+
+    - name: Start fd-hog
+      ansible.builtin.systemd_service:
+        name: fd-hog.service
+        state: restarted
+        enabled: true
+        daemon_reload: true
+      when: lab_state == 'present'
+
+    - name: Stop fd-hog
+      ansible.builtin.systemd_service:
+        name: fd-hog.service
+        state: stopped
+        enabled: false
+      failed_when: false
+      when: lab_state == 'absent'
+
+    - name: Remove fd-hog files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/fd-hog.service
+        - /usr/local/lib/fd-hog
+      when: lab_state == 'absent'
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: lab_state == 'absent'

@@ -1,0 +1,75 @@
+---
+# Lab: nginx with a very low open files limit, so it logs
+# "Too many open files" under load (see hold-connections.py).
+# Usage: ansible-playbook test/lab-nginx.yml [-e lab_nofile=64]
+- name: Lab nginx with a low LimitNOFILE
+  hosts: app_servers
+  become: true
+  vars:
+    lab_nofile: 32
+
+  tasks:
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # stderr goes to the journal and needs no new file descriptor
+    - name: Log nginx errors to stderr
+      ansible.builtin.lineinfile:
+        path: /etc/nginx/nginx.conf
+        line: error_log stderr;
+        insertafter: '^pid '
+        validate: nginx -t -q -c %s
+
+    - name: Log http errors to stderr
+      ansible.builtin.copy:
+        dest: /etc/nginx/conf.d/lab-journal.conf
+        content: |
+          # lab: http errors to the journal
+          error_log stderr warn;
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create drop-in directory
+      ansible.builtin.file:
+        path: /etc/systemd/system/nginx.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Set the low limit
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/nginx.service.d/10-lab-low-limit.conf
+        content: |
+          # lab: low limit to get "Too many open files"
+          [Service]
+          LimitNOFILE={{ lab_nofile }}
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Remove the fix from an earlier run
+      ansible.builtin.file:
+        path: /etc/systemd/system/nginx.service.d/90-nofile.conf
+        state: absent
+
+    - name: Restart nginx
+      ansible.builtin.systemd_service:
+        name: nginx.service
+        state: restarted
+        enabled: true
+        daemon_reload: true
+
+    - name: Read the nginx limit
+      ansible.builtin.shell: prlimit --pid "$(systemctl show -p MainPID --value nginx.service)" --nofile
+      register: lab_limit
+      changed_when: false
+
+    - name: Show the nginx limit
+      ansible.builtin.debug:
+        var: lab_limit.stdout_lines
