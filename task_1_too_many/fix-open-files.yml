@@ -1,0 +1,451 @@
+---
+# fix-open-files.yml
+#
+# Finds systemd services that run out of open files ("Too many open files"),
+# raises their LimitNOFILE with a drop-in, restarts them and checks the new
+# limit. A service is picked up when it logged the error since it started,
+# or when one of its processes uses 80% or more of its limit right now.
+#
+# Usage:
+#   ansible-playbook fix-open-files.yml --check --diff    # dry run
+#   ansible-playbook fix-open-files.yml
+#   ansible-playbook fix-open-files.yml -e '{"fix_max_limits": {"nginx": 4096}}'
+#
+# Changes are written to /var/log/fix-open-files.log on the target.
+
+- name: Fix "Too many open files" for systemd services
+  hosts: app_servers
+  become: true
+  serial: 1
+  max_fail_percentage: 0
+
+  vars:
+    # default soft limit, the hard limit is never lowered
+    fix_target: 65536
+    # own limit per service (soft and hard), e.g. {"nginx": 4096}
+    fix_max_limits: {}
+    # "all" or a list of services that may be changed
+    fix_auto_units: all
+    # only reported, never restarted when fix_auto_units is "all"
+    fix_protected_units:
+      - ssh
+      - sshd
+      - dbus
+      - polkit
+      - cron
+      - rsyslog
+      - snapd
+      - containerd
+      - docker
+      - systemd-journald
+      - systemd-logind
+      - systemd-networkd
+      - systemd-resolved
+      - systemd-timesyncd
+      - systemd-udevd
+    # always set the limit for these
+    fix_units: []
+    fix_since: "1h ago"
+    fix_min_errors: 5
+    fix_usage_percent: 80
+    fix_audit_log: /var/log/fix-open-files.log
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+  tasks:
+    - name: Check that the host uses systemd
+      ansible.builtin.assert:
+        that: ansible_facts.service_mgr == 'systemd'
+        fail_msg: This playbook needs a systemd host.
+        quiet: true
+
+    - name: Read fs.nr_open
+      ansible.builtin.command:
+        argv: [sysctl, -n, fs.nr_open]
+      register: fix_nr_open
+      changed_when: false
+      check_mode: false
+
+    # unit names are used in file paths
+    - name: Validate settings
+      ansible.builtin.assert:
+        that:
+          - fix_target | int >= 1024
+          - fix_target | int <= fix_nr_open.stdout | int
+          - fix_min_errors | int >= 1
+          - fix_usage_percent | int >= 1
+          - fix_usage_percent | int <= 100
+          - fix_audit_log is match('^/')
+          - fix_auto_units == 'all' or (fix_auto_units is iterable and fix_auto_units is not string and fix_auto_units is not mapping)
+          - fix_all_names | reject('match', '^[A-Za-z0-9][A-Za-z0-9@._-]*$') | list | length == 0
+          - fix_all_names | select('search', '[.][.]|[.]service$') | list | length == 0
+          - fix_max_limits.values() | map('int') | select('lt', 1024) | list | length == 0
+          - fix_max_limits.values() | map('int') | select('gt', fix_nr_open.stdout | int) | list | length == 0
+        fail_msg: >-
+          Bad settings. Use unit names without ".service", limits between 1024
+          and {{ fix_nr_open.stdout }}, fix_auto_units "all" or a list.
+        quiet: true
+      vars:
+        fix_all_names: >-
+          {{ fix_units + fix_protected_units + (fix_max_limits | list)
+             + ([] if fix_auto_units == 'all' else fix_auto_units | list) }}
+
+    # "file[s]" so the command line itself (logged by ansible) does not match
+    - name: Search the journal for the error
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --quiet
+          - --no-pager
+          - --boot
+          - --since={{ fix_since }}
+          - --grep=too many open file[s](?! in system)
+          - --case-sensitive=false
+          - --lines=5000
+          - --output=json
+          - --output-fields=_SYSTEMD_UNIT
+      register: fix_journal
+      changed_when: false
+      failed_when: >-
+        fix_journal.rc > 1
+        or (fix_journal.rc == 1 and fix_journal.stderr | length > 0)
+      check_mode: false
+
+    - name: Search the journal for ENFILE
+      ansible.builtin.command:
+        argv:
+          - journalctl
+          - --quiet
+          - --no-pager
+          - --boot
+          - --since={{ fix_since }}
+          - --grep=too many open files in syste[m]
+          - --case-sensitive=false
+          - --lines=1000
+          - --output=json
+          - --output-fields=_SYSTEMD_UNIT
+      register: fix_enfile
+      changed_when: false
+      failed_when: >-
+        fix_enfile.rc > 1
+        or (fix_enfile.rc == 1 and fix_enfile.stderr | length > 0)
+      check_mode: false
+
+    - name: Count open files of every running service
+      ansible.builtin.command:
+        argv: [python3, "-"]
+        stdin: "{{ fix_scan_script }}"
+      register: fix_scan
+      changed_when: false
+      check_mode: false
+      vars:
+        fix_scan_script: !unsafe |
+          import json
+          import os
+
+          roots = ("/sys/fs/cgroup/system.slice",
+                   "/sys/fs/cgroup/unified/system.slice",
+                   "/sys/fs/cgroup/systemd/system.slice")
+          root = next((p for p in roots if os.path.isdir(p)), None)
+
+          result = []
+          for path, _dirs, files in (os.walk(root) if root else []):
+              name = os.path.basename(path)
+              if not name.endswith(".service") or "cgroup.procs" not in files:
+                  continue
+              try:
+                  with open(os.path.join(path, "cgroup.procs")) as f:
+                      pids = [int(p) for p in f.read().split()]
+              except (OSError, ValueError):
+                  continue
+              best = None
+              for pid in pids:
+                  try:
+                      used = len(os.listdir("/proc/%d/fd" % pid))
+                      with open("/proc/%d/limits" % pid) as f:
+                          soft = [l.split()[3] for l in f if l.startswith("Max open files")][0]
+                  except (OSError, IndexError):
+                      continue
+                  if not soft.isdigit() or int(soft) == 0:
+                      continue
+                  percent = used * 100 // int(soft)
+                  if best is None or percent > best["percent"]:
+                      best = dict(unit=name[:-len(".service")], pid=pid,
+                                  open=used, soft=int(soft), percent=percent)
+              if best:
+                  result.append(best)
+          print(json.dumps(result))
+
+    # only system services, not ssh sessions or user units
+    - name: Collect journal hits and usage
+      ansible.builtin.set_fact:
+        fix_hits: >-
+          {{ fix_journal.stdout_lines
+             | map('from_json')
+             | selectattr('_SYSTEMD_UNIT', 'defined')
+             | selectattr('_SYSTEMD_UNIT', 'search', '[.]service$')
+             | list }}
+        fix_usage: "{{ fix_scan.stdout | from_json }}"
+        fix_plan: []
+
+    - name: List candidate units
+      ansible.builtin.set_fact:
+        fix_usage_by_unit: "{{ dict(fix_usage | map(attribute='unit') | zip(fix_usage)) }}"
+        fix_candidates: >-
+          {{ ((fix_hits | map(attribute='_SYSTEMD_UNIT')
+               | map('regex_replace', '[.]service$', '') | list)
+              + fix_units
+              + (fix_usage | selectattr('percent', 'ge', fix_usage_percent | int)
+                 | map(attribute='unit') | list))
+             | unique | sort }}
+
+    - name: Read unit limits and start time
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - --property=LoadState
+          - --property=MainPID
+          - --property=ExecMainStartTimestampMonotonic
+          - --property=LimitNOFILESoft
+          - --property=LimitNOFILE
+          - "{{ item }}.service"
+      loop: "{{ fix_candidates }}"
+      register: fix_show
+      changed_when: false
+      check_mode: false
+
+    - name: Read limit of the running process
+      ansible.builtin.command:
+        argv: [prlimit, --pid, "{{ fix_props.MainPID }}", --nofile, --raw, --noheadings, --output, SOFT]
+      loop: "{{ fix_show.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      vars:
+        fix_props: "{{ dict(item.stdout_lines | map('split', '=')) }}"
+      register: fix_running
+      changed_when: false
+      check_mode: false
+      when: fix_props.MainPID != '0'
+
+    - name: Decide what to do with each unit
+      ansible.builtin.set_fact:
+        fix_plan: >-
+          {{ fix_plan + [{
+               'unit': fix_unit,
+               'action': fix_action,
+               'reason': fix_reason | join(','),
+               'errors': fix_errors | int,
+               'open': fix_use.open | int,
+               'open_limit': fix_use.soft | int,
+               'percent': fix_use.percent | int,
+               'pid': fix_props.MainPID | int,
+               'soft': fix_soft,
+               'target': fix_goal | int,
+               'hard': (fix_goal | int) if fix_unit in fix_max_limits
+                       else [fix_target | int, fix_props.LimitNOFILE | int] | max}] }}
+      loop: "{{ fix_show.results | zip(fix_running.results) | list }}"
+      loop_control:
+        label: "{{ item.0.item }}"
+      vars:
+        fix_unit: "{{ item.0.item }}"
+        fix_props: "{{ dict(item.0.stdout_lines | map('split', '=')) }}"
+        fix_goal: "{{ fix_max_limits[fix_unit] | default(fix_target) }}"
+        fix_soft: "{{ item.1.stdout | default(fix_props.LimitNOFILESoft) }}"
+        # errors logged after the current process started
+        fix_errors: >-
+          {{ fix_hits
+             | selectattr('_SYSTEMD_UNIT', 'equalto', fix_unit ~ '.service')
+             | map(attribute='__MONOTONIC_TIMESTAMP') | map('int')
+             | select('gt', fix_props.ExecMainStartTimestampMonotonic | int)
+             | list | length }}
+        fix_use: "{{ fix_usage_by_unit[fix_unit] | default({'open': 0, 'soft': 0, 'percent': 0}) }}"
+        fix_reason: >-
+          {{ (['requested'] if fix_unit in fix_units else [])
+             + (['journal'] if fix_errors | int >= fix_min_errors | int else [])
+             + (['usage'] if fix_use.percent | int >= fix_usage_percent | int else []) }}
+        fix_allowed: >-
+          {{ (fix_auto_units == 'all' and fix_unit not in fix_protected_units)
+             or (fix_auto_units != 'all' and fix_unit in fix_auto_units) }}
+        fix_action: |-
+          {%- if fix_props.LoadState != 'loaded' -%}
+          not-installed
+          {%- elif fix_soft | string is not match('^[0-9]+$')
+                   or fix_props.LimitNOFILE | string is not match('^[0-9]+$') -%}
+          unsupported-value
+          {%- elif fix_unit in fix_units -%}
+          {{ 'raise' if fix_soft | int < fix_goal | int
+             else ('at-target' if fix_reason | length > 1 else 'ok') }}
+          {%- elif fix_reason | length == 0 -%}
+          no-evidence
+          {%- elif fix_auto_units == 'all' and fix_unit in fix_protected_units -%}
+          protected
+          {%- elif not fix_allowed | bool -%}
+          report-only
+          {%- elif fix_soft | int >= fix_goal | int -%}
+          at-target
+          {%- else -%}
+          raise
+          {%- endif -%}
+
+    - name: Fail on requested units that are not installed
+      ansible.builtin.assert:
+        that: fix_plan | selectattr('action', 'equalto', 'not-installed') | list | length == 0
+        fail_msg: >-
+          Not installed on {{ inventory_hostname }}:
+          {{ fix_plan | selectattr('action', 'equalto', 'not-installed') | map(attribute='unit') | join(', ') }}
+        quiet: true
+
+    - name: Pick the units to change
+      ansible.builtin.set_fact:
+        fix_raise: "{{ fix_plan | selectattr('action', 'equalto', 'raise') | list }}"
+
+    - name: Create drop-in directories
+      ansible.builtin.file:
+        path: /etc/systemd/system/{{ item.unit }}.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ fix_raise }}"
+      loop_control:
+        label: "{{ item.unit }}"
+
+    - name: Write LimitNOFILE drop-ins
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/{{ item.unit }}.service.d/90-nofile.conf
+        content: |
+          # Managed by Ansible (fix-open-files.yml). Do not edit by hand.
+          [Service]
+          LimitNOFILE={{ item.target }}:{{ item.hard }}
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ fix_raise }}"
+      loop_control:
+        label: "{{ item.unit }}"
+      notify: Reload systemd
+
+    - name: Reload systemd now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Read the limit systemd will use
+      ansible.builtin.command:
+        argv: [systemctl, show, --property=LimitNOFILESoft, --value, "{{ item.unit }}.service"]
+      loop: "{{ fix_raise }}"
+      loop_control:
+        label: "{{ item.unit }}"
+      register: fix_effective
+      changed_when: false
+      check_mode: false
+
+    - name: Check that no other drop-in overrides the limit
+      ansible.builtin.assert:
+        that: item.stdout == item.item.target | string
+        fail_msg: >-
+          systemd uses {{ item.stdout }} for {{ item.item.unit }}, not {{ item.item.target }}.
+          Check "systemctl cat {{ item.item.unit }}".
+        quiet: true
+      loop: "{{ fix_effective.results }}"
+      loop_control:
+        label: "{{ item.item.unit }}"
+      when: not ansible_check_mode
+
+    # stopped services are not started
+    - name: Restart running services
+      ansible.builtin.systemd_service:
+        name: "{{ item.unit }}.service"
+        state: restarted
+      loop: "{{ fix_raise | rejectattr('pid', 'equalto', 0) | list }}"
+      loop_control:
+        label: "{{ item.unit }}"
+      register: fix_restarted
+
+    - name: Get the new main PID
+      ansible.builtin.command:
+        argv: [systemctl, show, --property=MainPID, --value, "{{ item.item.unit }}.service"]
+      loop: "{{ fix_restarted.results }}"
+      loop_control:
+        label: "{{ item.item.unit }}"
+      register: fix_new_pid
+      changed_when: false
+      until: fix_new_pid.stdout != '0'
+      retries: 5
+      delay: 2
+      when: not ansible_check_mode
+
+    - name: Check the limit of the new process
+      ansible.builtin.command:
+        argv: [prlimit, --pid, "{{ item.stdout }}", --nofile, --raw, --noheadings, --output, SOFT]
+      loop: "{{ fix_new_pid.results }}"
+      loop_control:
+        label: "{{ item.item.item.unit }}"
+      register: fix_new_limit
+      changed_when: false
+      failed_when: fix_new_limit.stdout != item.item.item.target | string
+      when: not ansible_check_mode
+
+    - name: Write audit log
+      ansible.builtin.lineinfile:
+        path: "{{ fix_audit_log }}"
+        line: >-
+          {{ {'time': ansible_facts.date_time.iso8601, 'unit': item.unit,
+              'reason': item.reason, 'errors': item.errors,
+              'open': item.open, 'open_limit': item.open_limit,
+              'from_soft': item.soft | int, 'to_soft': item.target,
+              'to_hard': item.hard, 'restarted': item.pid != 0} | to_json }}
+        create: true
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ fix_raise }}"
+      loop_control:
+        label: "{{ item.unit }}"
+
+    - name: Write the change to the journal
+      ansible.builtin.command:
+        argv:
+          - logger
+          - --tag=fix-open-files
+          - --priority=user.warning
+          - >-
+            {{ item.unit }}.service LimitNOFILE raised from {{ item.soft }}
+            to {{ item.target }}:{{ item.hard }} ({{ item.reason }}:
+            {{ item.errors }} EMFILE errors, {{ item.open }}/{{ item.open_limit }} open)
+      loop: "{{ fix_raise }}"
+      loop_control:
+        label: "{{ item.unit }}"
+      changed_when: true
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.unit }}: {{ fix_text[item.action] }} (evidence: {{ item.reason or 'none' }};
+          errors since start: {{ item.errors }}; open now: {{ item.open }}/{{ item.open_limit }};
+          soft limit was {{ item.soft }})
+      loop: "{{ fix_plan | rejectattr('action', 'equalto', 'no-evidence') | list }}"
+      loop_control:
+        label: "{{ item.unit }}"
+      vars:
+        fix_text:
+          raise: "{{ 'would be raised' if ansible_check_mode else 'raised' }} to {{ item.target }}:{{ item.hard }}"
+          ok: already at its limit
+          at-target: still at its limit, look for a descriptor leak or raise its maximum
+          protected: protected service, change it by hand or add it to fix_units
+          report-only: not in fix_auto_units, nothing changed
+          unsupported-value: limit is not a number, nothing changed
+
+    - name: Report when nothing was found
+      ansible.builtin.debug:
+        msg: No service is limited and no unit was requested.
+      when: fix_plan | rejectattr('action', 'equalto', 'no-evidence') | list | length == 0
+
+    - name: Warn about ENFILE
+      ansible.builtin.debug:
+        msg: >-
+          {{ fix_enfile.stdout_lines | length }} journal line(s) report "Too many open
+          files in system". That is fs.file-max, check /proc/sys/fs/file-nr.
+      when: fix_enfile.stdout_lines | length > 0

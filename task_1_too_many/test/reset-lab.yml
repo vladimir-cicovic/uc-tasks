@@ -1,0 +1,84 @@
+---
+# Lab reset: removes fd-hog, the limit drop-ins written by
+# fix-open-files.yml, the audit log and the logs, then sets up the
+# low-limit nginx again. Run it with ../reset-lab.sh.
+
+- name: Remove fd-hog
+  ansible.builtin.import_playbook: lab-fd-hog.yml
+  vars:
+    lab_state: absent
+
+- name: Remove the fixes
+  hosts: app_servers
+  become: true
+  tasks:
+    - name: Find drop-ins written by fix-open-files.yml
+      ansible.builtin.find:
+        paths: /etc/systemd/system
+        patterns: 90-nofile.conf
+        recurse: true
+        contains: '# Managed by Ansible'
+      register: reset_dropins
+
+    - name: Remove the drop-ins
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ reset_dropins.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+
+    # try-restart only touches running services, rc 5 = unit is gone
+    - name: Restart the services that had a fix
+      ansible.builtin.command:
+        argv: [systemctl, try-restart, "{{ reset_unit }}"]
+      loop: "{{ reset_dropins.files }}"
+      loop_control:
+        label: "{{ reset_unit }}"
+      vars:
+        reset_unit: "{{ item.path | dirname | basename | regex_replace('[.]d$', '') }}"
+      register: reset_restart
+      changed_when: reset_restart.rc == 0
+      failed_when: reset_restart.rc not in [0, 5]
+
+    - name: Remove the audit log
+      ansible.builtin.file:
+        path: /var/log/fix-open-files.log
+        state: absent
+
+- name: Set up nginx again
+  ansible.builtin.import_playbook: lab-nginx.yml
+
+- name: Clear the logs
+  hosts: app_servers
+  become: true
+  tasks:
+    - name: Empty the nginx logs
+      ansible.builtin.command:
+        argv: [truncate, --size=0, /var/log/nginx/error.log, /var/log/nginx/access.log]
+      changed_when: true
+
+    - name: Clear the journal
+      ansible.builtin.shell: journalctl --rotate && journalctl --vacuum-time=1s
+      changed_when: true
+
+    # "file[s]" so this command line is not counted
+    - name: Read the new state
+      ansible.builtin.shell: |
+        pid=$(systemctl show -p MainPID --value nginx)
+        echo "nginx limit (soft hard): $(prlimit --pid "$pid" --nofile --raw --noheadings --output SOFT,HARD)"
+        echo "nginx drop-ins: $(ls /etc/systemd/system/nginx.service.d/ | tr '\n' ' ')"
+        echo "other limit drop-ins: $(find /etc/systemd/system -name 90-nofile.conf | wc -l)"
+        echo "fd-hog: $(systemctl cat fd-hog.service >/dev/null 2>&1 && echo present || echo removed)"
+        echo "audit log: $(test -e /var/log/fix-open-files.log && echo present || echo removed)"
+        echo "errors in journal: $(journalctl -q --no-pager --grep 'too many open file[s]' | wc -l)"
+      register: reset_state
+      changed_when: false
+
+    - name: Show the new state
+      ansible.builtin.debug:
+        var: reset_state.stdout_lines
