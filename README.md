@@ -44,3 +44,11 @@
    up with the most elaborate "fail scenario". (there is no "right" answer)
 
    Solution: branch `task_5_lost_ssh`.
+
+6. (Bonus Question) Looking at the graphs of your monitoring solution one of
+   your high-traffic servers has few of the cores on 100% and others running
+   fairly low at 20%. Looking at top/htop output this load is not coming from
+   "userland". What would your troubleshooting steps be? (there is no "right"
+   answer)
+
+   Solution: branch `task_6_cpu_high_usage`.
