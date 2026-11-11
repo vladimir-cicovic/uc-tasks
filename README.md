@@ -15,10 +15,3 @@
    (or rather pass pylint check with flying colors).
 
    Solution: branch `task_2_geoip_loop`.
-
-3. Package the said script into Docker container and ensure that script runs
-   when container is started and that sqlite database is created on host
-   machine (not inside the container). Bonus points for doing this with
-   smallest possible docker image.
-
-   Solution: branch `task_3_docker_sqlite`.
