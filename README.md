@@ -32,3 +32,15 @@
    sentences per tech is enough). (there is no "right" answer)
 
    Solution: branch `task_4_infa_virtual`.
+
+5. At 4 a.m. Friday night you get a call from NOC member that one of the
+   servers on one of the locations is reported as down and that he has tried
+   to ssh over public network to it but it just times out. Since this is one
+   of the "more important" servers you have to check it yourself. You know
+   that there are other servers at the same location and that they are all
+   interconnected through a switch in a "private" network which you can
+   access. SSH is not bound to any interface. What would be your
+   troubleshooting steps? Explain what are you checking and why. Try to come
+   up with the most elaborate "fail scenario". (there is no "right" answer)
+
+   Solution: branch `task_5_lost_ssh`.
