@@ -22,3 +22,13 @@
    smallest possible docker image.
 
    Solution: branch `task_3_docker_sqlite`.
+
+4. Given that you have complex time-critical high-traffic bare-metal
+   java-powered infrastructure and also lighter virtualized services (cmdb,
+   jenkins, nexus, gitlab, etc) describe your vision for monitoring,
+   provisioning, de-provisioning, back-up-ing, hypervisor-ing, log collecting?
+   This question is aimed more at technologies / products that you would use
+   so giving a list of technologies and brief reason for them (1 or 2
+   sentences per tech is enough). (there is no "right" answer)
+
+   Solution: branch `task_4_infa_virtual`.
