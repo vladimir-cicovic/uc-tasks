@@ -1,0 +1,8 @@
+# Send only the files the build needs (never data/ with the database).
+*
+!requirements.txt
+!prepare.sh
+!versions.env
+!sources
+!rootfs.sh
+!geoip_loop.py
